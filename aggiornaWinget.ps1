@@ -49,6 +49,41 @@ function Get-WingetUpgradeIds {
     return $ids | Select-Object -Unique
 }
 
+function Wait-ProcessWithCountdown {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [int]$TimeoutSeconds,
+        [string]$PackageId
+    )
+
+    $startTime = Get-Date
+
+    while (-not $Process.HasExited) {
+        $elapsed = [int]((Get-Date) - $startTime).TotalSeconds
+        $remaining = $TimeoutSeconds - $elapsed
+
+        if ($remaining -le 0) {
+            Write-Progress -Activity "Aggiornamento $PackageId" -Status "Timeout raggiunto" -PercentComplete 100 -SecondsRemaining 0 -Completed
+            return $false
+        }
+
+        $percent = [math]::Floor(($elapsed / $TimeoutSeconds) * 100)
+        if ($percent -gt 100) { $percent = 100 }
+
+        Write-Progress `
+            -Activity "Aggiornamento $PackageId" `
+            -Status "Tempo rimanente: $remaining secondi" `
+            -PercentComplete $percent `
+            -SecondsRemaining $remaining
+
+        Start-Sleep -Seconds 1
+        $Process.Refresh()
+    }
+
+    Write-Progress -Activity "Aggiornamento $PackageId" -Completed
+    return $true
+}
+
 $ok = 0
 $skip = 0
 $err = 0
@@ -74,16 +109,9 @@ foreach ($id in $ids) {
     )
 
     $proc = Start-Process -FilePath 'winget' -ArgumentList $argList -PassThru -WindowStyle Hidden
-    $timedOut = $false
+    $completed = Wait-ProcessWithCountdown -Process $proc -TimeoutSeconds $TimeoutSeconds -PackageId $id
 
-    try {
-        $proc | Wait-Process -Timeout $TimeoutSeconds -ErrorAction Stop
-    }
-    catch {
-        $timedOut = $true
-    }
-
-    if ($timedOut -and -not $proc.HasExited) {
+    if (-not $completed -and -not $proc.HasExited) {
         Write-Host ("ATTENZIONE: timeout su " + $id + ", aggiornamento saltato.") -ForegroundColor Yellow
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
         Add-Summary ("[SKIP-TIMEOUT] " + $id)
