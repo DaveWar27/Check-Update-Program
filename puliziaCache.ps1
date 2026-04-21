@@ -1,81 +1,86 @@
 $ErrorActionPreference = 'SilentlyContinue'
 
-function Get-FolderFilesSizeBytes {
-    param([string]$Path)
+function Stop-ServiceForce {
+    param([string]$Name)
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (-not $svc) { return }
 
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return 0
+    if ($svc.Status -eq 'Running' -or $svc.Status -eq 'StartPending') {
+        Write-Host "Arresto servizio '$Name' in corso..." -ForegroundColor Gray
+        # Avvia l'arresto senza bloccarsi (NoWait)
+        Stop-Service -Name $Name -Force -NoWait -ErrorAction SilentlyContinue
     }
 
-    $files = Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue
-    if (-not $files) {
-        return 0
+    # Aspetta massimo 5 secondi
+    $timeout = 5
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    
+    while ($stopwatch.Elapsed.TotalSeconds -lt $timeout) {
+        $svc.Refresh()
+        if ($svc.Status -eq 'Stopped') { return }
+        Start-Sleep -Milliseconds 500
     }
 
-    $sum = ($files | Measure-Object Length -Sum).Sum
-    if (-not $sum) { return 0 }
-    return [int64]$sum
-}
-
-function Remove-FolderContentSafe {
-    param([string]$Path)
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return
+    # Se dopo 5 secondi è ancora incastrato (es. in 'StopPending'), killa il PID!
+    $svc.Refresh()
+    if ($svc.Status -ne 'Stopped') {
+        Write-Host "Il servizio '$Name' e bloccato. Chiusura forzata del processo..." -ForegroundColor Yellow
+        $wmiSvc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$Name'"
+        if ($wmiSvc -and $wmiSvc.ProcessId -gt 0) {
+            Stop-Process -Id $wmiSvc.ProcessId -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
+        }
     }
-
-    Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
-        Remove-Item -Force -ErrorAction SilentlyContinue
-
-    Get-ChildItem -LiteralPath $Path -Recurse -Force -Directory -ErrorAction SilentlyContinue |
-        Sort-Object FullName -Descending |
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-function Format-MB {
-    param([double]$Value)
-    return [math]::Round($Value, 2).ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
 try {
-    $tempBytes = 0
-    $wuBytes = 0
-
-    $tempPaths = @(
-        $env:TEMP,
-        'C:\Windows\Temp'
-    )
-
-    foreach ($p in $tempPaths) {
-        $tempBytes += Get-FolderFilesSizeBytes -Path $p
+    # Calcola spazio iniziale
+    $tempSize = 0
+    $tempFolders = @($env:TEMP, "$env:windir\Temp", "$env:LOCALAPPDATA\Temp")
+    foreach ($f in $tempFolders) {
+        if (Test-Path $f) {
+            $items = Get-ChildItem -Path $f -Recurse -File -ErrorAction SilentlyContinue
+            if ($items) {
+                $tempSize += ($items | Measure-Object -Property Length -Sum).Sum
+            }
+        }
     }
 
-    foreach ($p in $tempPaths) {
-        Remove-FolderContentSafe -Path $p
+    $sizeMB = [math]::Round($tempSize / 1MB, 2)
+    Write-Host ("Spazio occupato da TEMP e Windows TEMP: " + $sizeMB + " MB") -ForegroundColor Green
+
+    # Pulizia Windows Update e cache DNS
+    Write-Host "Pulizia cache Windows Update e DNS..." -ForegroundColor Gray
+    
+    # Arresto sicuro (senza loop infinito)
+    Stop-ServiceForce -Name "wuauserv"
+    Stop-ServiceForce -Name "bits"
+    Stop-ServiceForce -Name "cryptsvc"
+
+    # Svuota cartelle Windows Update
+    $sd = "$env:windir\SoftwareDistribution\Download"
+    if (Test-Path $sd) {
+        Remove-Item -Path "$sd\*" -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    
+    # Ripulisci DNS
+    Clear-DnsClientCache -ErrorAction SilentlyContinue
+
+    # Riavvio servizi essenziali
+    Start-Service -Name "wuauserv" -ErrorAction SilentlyContinue
+    Start-Service -Name "bits" -ErrorAction SilentlyContinue
+    Start-Service -Name "cryptsvc" -ErrorAction SilentlyContinue
+
+    # Pulizia Temp
+    foreach ($f in $tempFolders) {
+        if (Test-Path $f) {
+            Remove-Item -Path "$f\*" -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
-    Write-Host ("Spazio liberato da TEMP e Windows TEMP: " + (Format-MB ($tempBytes / 1MB)) + " MB") -ForegroundColor Green
-
-    $wuPath = 'C:\Windows\SoftwareDistribution\Download'
-    $wuBytes = Get-FolderFilesSizeBytes -Path $wuPath
-
-    Write-Host 'Pulizia cache Windows Update...' -ForegroundColor Gray
-    Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
-    Stop-Service -Name bits -Force -ErrorAction SilentlyContinue
-
-    Remove-FolderContentSafe -Path $wuPath
-
-    Start-Service -Name bits -ErrorAction SilentlyContinue
-    Start-Service -Name wuauserv -ErrorAction SilentlyContinue
-
-    Write-Host ("Spazio liberato da cache Windows Update: " + (Format-MB ($wuBytes / 1MB)) + " MB") -ForegroundColor Green
-
-    $totalBytes = $tempBytes + $wuBytes
-    Write-Host ("Totale spazio liberato dalla pulizia: " + (Format-MB ($totalBytes / 1MB)) + " MB") -ForegroundColor Magenta
-
+    Write-Host "Pulizia cache completata con successo." -ForegroundColor Green
     exit 0
-}
-catch {
-    Write-Host 'ERRORE PULIZIA: pulizia temporanei/cache non riuscita.' -ForegroundColor Red
-    exit 30
+} catch {
+    Write-Host ("ERRORE PULIZIA: " + $_.Exception.Message) -ForegroundColor Red
+    exit 1
 }

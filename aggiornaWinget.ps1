@@ -49,7 +49,7 @@ function Get-WingetUpgradeIds {
     return $ids | Select-Object -Unique
 }
 
-function Wait-ProcessWithCountdown {
+function Wait-ProcessWithTextCountdown {
     param(
         [System.Diagnostics.Process]$Process,
         [int]$TimeoutSeconds,
@@ -57,30 +57,27 @@ function Wait-ProcessWithCountdown {
     )
 
     $startTime = Get-Date
+    $elapsed = 0
 
     while (-not $Process.HasExited) {
         $elapsed = [int]((Get-Date) - $startTime).TotalSeconds
         $remaining = $TimeoutSeconds - $elapsed
 
         if ($remaining -le 0) {
-            Write-Progress -Activity "Aggiornamento $PackageId" -Status "Timeout raggiunto" -PercentComplete 100 -SecondsRemaining 0 -Completed
+            # Va a capo se va in timeout
+            Write-Host "`r[TIMEOUT] $PackageId ha superato i $TimeoutSeconds sec!                     " -ForegroundColor Yellow
             return $false
         }
 
-        $percent = [math]::Floor(($elapsed / $TimeoutSeconds) * 100)
-        if ($percent -gt 100) { $percent = 100 }
-
-        Write-Progress `
-            -Activity "Aggiornamento $PackageId" `
-            -Status "Tempo rimanente: $remaining secondi" `
-            -PercentComplete $percent `
-            -SecondsRemaining $remaining
+        # Stampa sulla stessa riga sovrascrivendo grazie al carriage return (`r) e al -NoNewline
+        Write-Host "`r-> $PackageId in aggiornamento... timeout tra $remaining sec   " -NoNewline -ForegroundColor Cyan
 
         Start-Sleep -Seconds 1
         $Process.Refresh()
     }
 
-    Write-Progress -Activity "Aggiornamento $PackageId" -Completed
+    # Pulizia della riga testuale prima di passare al risultato
+    Write-Host "`r-> $PackageId processo terminato in $elapsed sec.                                  " -ForegroundColor Gray
     return $true
 }
 
@@ -109,7 +106,9 @@ foreach ($id in $ids) {
     )
 
     $proc = Start-Process -FilePath 'winget' -ArgumentList $argList -PassThru -WindowStyle Hidden
-    $completed = Wait-ProcessWithCountdown -Process $proc -TimeoutSeconds $TimeoutSeconds -PackageId $id
+    
+    # Sostituito con il nuovo countdown testuale infallibile
+    $completed = Wait-ProcessWithTextCountdown -Process $proc -TimeoutSeconds $TimeoutSeconds -PackageId $id
 
     if (-not $completed -and -not $proc.HasExited) {
         Write-Host ("ATTENZIONE: timeout su " + $id + ", aggiornamento saltato.") -ForegroundColor Yellow
