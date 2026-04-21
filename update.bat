@@ -11,9 +11,11 @@ set "RC=0"
 set "TPMPS1=%~dp0controlloTMP.ps1"
 set "NETPS1=%~dp0controlloRete.ps1"
 set "CLEANPS1=%~dp0puliziaCache.ps1"
+set "WINGETPS1=%~dp0aggiornaWinget.ps1"
 set "APP_EXPORT=%~dp0lista-app-winget.json"
+set "WINGET_SUMMARY=%TEMP%\winget_summary.txt"
+set "WINGET_SKIPPED=%TEMP%\winget_skipped.txt"
 set "MINFREEGB=5"
-set "UPDATERC=0"
 set "STOREUPDATERC=0"
 set "DRIVERRC=0"
 set "PNPRC=0"
@@ -28,6 +30,9 @@ set "ST_STORE=NON ESEGUITO"
 set "ST_PNP=NON ESEGUITO"
 set "ST_DRIVER=NON ESEGUITO"
 set "ST_TPM=NON ESEGUITO"
+
+del /q "%WINGET_SUMMARY%" 2>nul
+del /q "%WINGET_SKIPPED%" 2>nul
 
 powershell -NoProfile -Command "Write-Host '========================================' -ForegroundColor Cyan; Write-Host '    Aggiornamento automatico con WinGet' -ForegroundColor Cyan; Write-Host '========================================' -ForegroundColor Cyan"
 echo.
@@ -57,6 +62,13 @@ if not exist "%CLEANPS1%" (
     powershell -NoProfile -Command "Write-Host 'ERRORE: file puliziaCache.ps1 non trovato.' -ForegroundColor Red"
     set "ST_CLEAN=ERRORE - FILE MANCANTE"
     set "RC=4"
+    goto END
+)
+
+if not exist "%WINGETPS1%" (
+    powershell -NoProfile -Command "Write-Host 'ERRORE: file aggiornaWinget.ps1 non trovato.' -ForegroundColor Red"
+    set "ST_WINGET=ERRORE - FILE MANCANTE"
+    set "RC=5"
     goto END
 )
 
@@ -126,28 +138,15 @@ if not "%errorlevel%"=="0" (
 )
 
 echo.
-powershell -NoProfile -Command "Write-Host '[5/9] Aggiornamento pacchetti WinGet classici...' -ForegroundColor Cyan"
-winget upgrade --all --include-unknown --accept-package-agreements --accept-source-agreements --silent --disable-interactivity --verbose-logs
-set "UPDATERC=%errorlevel%"
-if not "%UPDATERC%"=="0" (
-    powershell -NoProfile -Command "Write-Host 'ERRORE DOWNLOAD/UPDATE: primo tentativo fallito.' -ForegroundColor Red"
-    winget error %UPDATERC%
-    powershell -NoProfile -Command "Write-Host 'Riprovo una sola volta...' -ForegroundColor Yellow"
-    winget source update
-    winget upgrade --all --include-unknown --accept-package-agreements --accept-source-agreements --silent --disable-interactivity --verbose-logs
-    set "UPDATERC=%errorlevel%"
-    if not "%UPDATERC%"=="0" (
-        set "ST_WINGET=ERRORE"
-        powershell -NoProfile -Command "Write-Host 'ERRORE DOWNLOAD/UPDATE: anche il secondo tentativo e fallito.' -ForegroundColor Red"
-        winget error %UPDATERC%
-        set "RC=%UPDATERC%"
-    ) else (
-        set "ST_WINGET=OK DOPO RITENTATIVO"
-        powershell -NoProfile -Command "Write-Host 'Recupero riuscito al secondo tentativo.' -ForegroundColor Green"
-    )
-) else (
+powershell -NoProfile -Command "Write-Host '[5/9] Aggiornamento pacchetti WinGet uno per uno con timeout...' -ForegroundColor Cyan"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%WINGETPS1%" -SummaryPath "%WINGET_SUMMARY%" -SkippedPath "%WINGET_SKIPPED%" -TimeoutSeconds 180
+if "%errorlevel%"=="0" (
     set "ST_WINGET=OK"
-    powershell -NoProfile -Command "Write-Host 'Aggiornamento pacchetti WinGet completato.' -ForegroundColor Green"
+) else if "%errorlevel%"=="50" (
+    set "ST_WINGET=ATTENZIONE - ALCUNI PACCHETTI SALTATI"
+) else (
+    set "ST_WINGET=ERRORE"
+    if "%RC%"=="0" set "RC=%errorlevel%"
 )
 
 echo.
@@ -236,6 +235,18 @@ call :PrintStatus "Microsoft Store" "%ST_STORE%"
 call :PrintStatus "PnP / hardware" "%ST_PNP%"
 call :PrintStatus "Driver" "%ST_DRIVER%"
 call :PrintStatus "TPM" "%ST_TPM%"
+
+if exist "%WINGET_SUMMARY%" (
+    echo.
+    powershell -NoProfile -Command "Write-Host 'Dettaglio aggiornamenti WinGet:' -ForegroundColor Cyan"
+    type "%WINGET_SUMMARY%"
+)
+
+if exist "%WINGET_SKIPPED%" (
+    echo.
+    powershell -NoProfile -Command "Write-Host 'Programmi saltati:' -ForegroundColor Yellow"
+    type "%WINGET_SKIPPED%"
+)
 
 echo.
 if not "%RC%"=="0" (
