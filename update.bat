@@ -8,7 +8,6 @@ cd /d "%~dp0"
 
 set "LOGDIR=%LOCALAPPDATA%\Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir"
 set "RC=0"
-set "TPMPS1=%~dp0controlloTMP.ps1"
 set "NETPS1=%~dp0controlloRete.ps1"
 set "CLEANPS1=%~dp0puliziaCache.ps1"
 set "WINGETPS1=%~dp0aggiornaWinget.ps1"
@@ -16,6 +15,7 @@ set "APP_EXPORT=%~dp0lista-app-winget.json"
 set "WINGET_SUMMARY=%TEMP%\winget_summary.txt"
 set "WINGET_SKIPPED=%TEMP%\winget_skipped.txt"
 set "MINFREEGB=5"
+set "WINGET_TIMEOUT=180"
 set "STOREUPDATERC=0"
 set "DRIVERRC=0"
 set "PNPRC=0"
@@ -42,13 +42,6 @@ if not "%errorlevel%"=="0" (
     powershell -NoProfile -Command "Write-Host 'Richiesta privilegi di amministratore...' -ForegroundColor Yellow"
     powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
     exit /b
-)
-
-if not exist "%TPMPS1%" (
-    powershell -NoProfile -Command "Write-Host 'ERRORE: file controlloTMP.ps1 non trovato.' -ForegroundColor Red"
-    set "ST_TPM=ERRORE - FILE MANCANTE"
-    set "RC=2"
-    goto END
 )
 
 if not exist "%NETPS1%" (
@@ -139,11 +132,14 @@ if not "%errorlevel%"=="0" (
 
 echo.
 powershell -NoProfile -Command "Write-Host '[5/9] Aggiornamento pacchetti WinGet uno per uno con timeout...' -ForegroundColor Cyan"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%WINGETPS1%" -SummaryPath "%WINGET_SUMMARY%" -SkippedPath "%WINGET_SKIPPED%" -TimeoutSeconds 180
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%WINGETPS1%" -SummaryPath "%WINGET_SUMMARY%" -SkippedPath "%WINGET_SKIPPED%" -TimeoutSeconds %WINGET_TIMEOUT%
 if "%errorlevel%"=="0" (
     set "ST_WINGET=OK"
 ) else if "%errorlevel%"=="50" (
     set "ST_WINGET=ATTENZIONE - ALCUNI PACCHETTI SALTATI"
+) else if "%errorlevel%"=="51" (
+    set "ST_WINGET=ERRORE - ALCUNI PACCHETTI FALLITI"
+    if "%RC%"=="0" set "RC=51"
 ) else (
     set "ST_WINGET=ERRORE"
     if "%RC%"=="0" set "RC=%errorlevel%"
@@ -200,22 +196,58 @@ if "%DRIVERRC%"=="40" (
 )
 
 echo.
-powershell -NoProfile -Command "Write-Host '[9/9] Aggiornamento lista applicazioni Winget...' -ForegroundColor Cyan"
-winget export -o "%APP_EXPORT%" --include-versions --accept-source-agreements
-if not "%errorlevel%"=="0" (
-    powershell -NoProfile -Command "Write-Host 'Avviso: impossibile aggiornare la lista applicazioni Winget.' -ForegroundColor Yellow"
-) else (
-    powershell -NoProfile -Command "Write-Host 'Lista applicazioni aggiornata in: %APP_EXPORT%' -ForegroundColor Green"
-)
-
-echo.
-powershell -NoProfile -Command "Write-Host '[TPM] Controllo e riparazione TPM...' -ForegroundColor Magenta"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%TPMPS1%"
+powershell -NoProfile -Command "Write-Host '[9/9] Controllo stato TPM...' -ForegroundColor Magenta"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+"try { ^
+    $t = Get-Tpm; ^
+    if (-not $t) { ^
+        Write-Host 'ERRORE TPM: impossibile interrogare il modulo TPM.' -ForegroundColor Red; ^
+        exit 101 ^
+    } ^
+    Write-Host ('TPM presente: ' + $t.TpmPresent) -ForegroundColor Gray; ^
+    Write-Host ('TPM pronto: ' + $t.TpmReady) -ForegroundColor Gray; ^
+    Write-Host ('TPM abilitato: ' + $t.TpmEnabled) -ForegroundColor Gray; ^
+    Write-Host ('TPM attivato: ' + $t.TpmActivated) -ForegroundColor Gray; ^
+    Write-Host ('TPM posseduto: ' + $t.TpmOwned) -ForegroundColor Gray; ^
+    if (-not $t.TpmPresent) { ^
+        Write-Host 'ERRORE TPM: TPM non presente o non rilevato.' -ForegroundColor Red; ^
+        exit 102 ^
+    } ^
+    if (-not $t.TpmEnabled -or -not $t.TpmReady) { ^
+        Write-Host 'ERRORE TPM: TPM presente ma non abilitato o non pronto.' -ForegroundColor Red; ^
+        exit 103 ^
+    } ^
+    $spec = $null; ^
+    try { $spec = (Get-CimInstance -Namespace root\CIMV2\Security\MicrosoftTpm -ClassName Win32_Tpm).SpecVersion } catch {} ^
+    if ($spec) { ^
+        Write-Host ('Versione TPM: ' + $spec) -ForegroundColor Gray; ^
+        if ($spec -notmatch '2\.0') { ^
+            Write-Host 'ERRORE TPM: versione inferiore a 2.0.' -ForegroundColor Red; ^
+            exit 104 ^
+        } ^
+    } else { ^
+        Write-Host 'AVVISO TPM: impossibile leggere la versione specifica.' -ForegroundColor Yellow; ^
+    } ^
+    Write-Host 'TPM OK.' -ForegroundColor Green; ^
+    exit 0 ^
+} catch { ^
+    Write-Host ('ERRORE TPM: ' + $_.Exception.Message) -ForegroundColor Red; ^
+    exit 105 ^
+}"
 if not "%errorlevel%"=="0" (
     set "ST_TPM=ERRORE"
     if "%RC%"=="0" set "RC=%errorlevel%"
 ) else (
     set "ST_TPM=OK"
+)
+
+echo.
+powershell -NoProfile -Command "Write-Host '[EXPORT] Aggiornamento lista applicazioni Winget...' -ForegroundColor Cyan"
+winget export -o "%APP_EXPORT%" --include-versions --accept-source-agreements
+if not "%errorlevel%"=="0" (
+    powershell -NoProfile -Command "Write-Host 'Avviso: impossibile aggiornare la lista applicazioni Winget.' -ForegroundColor Yellow"
+) else (
+    powershell -NoProfile -Command "Write-Host 'Lista applicazioni aggiornata in: %APP_EXPORT%' -ForegroundColor Green"
 )
 
 :END
