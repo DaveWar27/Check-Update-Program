@@ -5,143 +5,76 @@ param(
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
+$env:WINGET_DISABLE_PROGRESS_ANIMATION = '1'
+
+$ignoredIds = @(
+    'Microsoft.VisualStudio.Community',
+    'Microsoft.VisualStudio.2022.Community',
+    'Blitz.Blitz'
+)
 
 if ($SummaryPath) { Remove-Item $SummaryPath -Force -ErrorAction SilentlyContinue }
 if ($SkippedPath) { Remove-Item $SkippedPath -Force -ErrorAction SilentlyContinue }
 
-function Add-Summary {
-    param([string]$Text)
-    if ($SummaryPath) {
-        Add-Content -Path $SummaryPath -Value $Text
+$upgradeList = @()
+$lines = winget upgrade --accept-source-agreements --disable-interactivity 2>$null
+foreach ($line in $lines) {
+    if ($line -match '^\s*$') { continue }
+    if ($line -match '^-+$') { continue }
+    if ($line -match '^Name\s+Id\s+') { continue }
+    if ($line -match 'upgrades available') { continue }
+    if ($line -match 'No installed package') { continue }
+    if ($line -match '^(.+?)\s{2,}([^\s]+)\s{2,}([^\s]+)\s{2,}([^\s]+)\s*$') {
+        $name = $matches[1].Trim()
+        $id = $matches[2].Trim()
+        if ($id) { $upgradeList += [pscustomobject]@{ Name = $name; Id = $id } }
     }
 }
 
-function Add-Skipped {
-    param([string]$Text)
-    if ($SkippedPath) {
-        Add-Content -Path $SkippedPath -Value $Text
-    }
-}
-
-function Get-WingetUpgradeIds {
-    $lines = winget upgrade --accept-source-agreements 2>$null
-    $start = $false
-    $ids = @()
-
-    foreach ($line in $lines) {
-        if ($line -match '^-{3,}') {
-            $start = $true
-            continue
-        }
-
-        if (-not $start) { continue }
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
-
-        $parts = ($line -replace '\s{2,}', '|').Split('|')
-        if ($parts.Count -ge 2) {
-            $id = $parts[1].Trim()
-            if ($id -and $id -notmatch 'upgrades available') {
-                $ids += $id
-            }
-        }
-    }
-
-    return $ids | Select-Object -Unique
-}
-
-function Wait-ProcessWithTextCountdown {
-    param(
-        [System.Diagnostics.Process]$Process,
-        [int]$TimeoutSeconds,
-        [string]$PackageId
-    )
-
-    $startTime = Get-Date
-    $elapsed = 0
-
-    while (-not $Process.HasExited) {
-        $elapsed = [int]((Get-Date) - $startTime).TotalSeconds
-        $remaining = $TimeoutSeconds - $elapsed
-
-        if ($remaining -le 0) {
-            # Va a capo se va in timeout
-            Write-Host "`r[TIMEOUT] $PackageId ha superato i $TimeoutSeconds sec!                     " -ForegroundColor Yellow
-            return $false
-        }
-
-        # Stampa sulla stessa riga sovrascrivendo grazie al carriage return (`r) e al -NoNewline
-        Write-Host "`r-> $PackageId in aggiornamento... timeout tra $remaining sec   " -NoNewline -ForegroundColor Cyan
-
-        Start-Sleep -Seconds 1
-        $Process.Refresh()
-    }
-
-    # Pulizia della riga testuale prima di passare al risultato
-    Write-Host "`r-> $PackageId processo terminato in $elapsed sec.                                  " -ForegroundColor Gray
-    return $true
-}
-
-$ok = 0
-$skip = 0
-$err = 0
-
-$ids = Get-WingetUpgradeIds
-
-if (-not $ids -or $ids.Count -eq 0) {
-    Write-Host 'Nessun aggiornamento WinGet disponibile.' -ForegroundColor Green
-    Add-Summary 'Nessun aggiornamento WinGet disponibile.'
+if (-not $upgradeList -or $upgradeList.Count -eq 0) {
+    Write-Host 'Nessun aggiornamento WinGet trovato.' -ForegroundColor Green
     exit 0
 }
 
-foreach ($id in $ids) {
-    Write-Host ("Aggiorno pacchetto: " + $id) -ForegroundColor Gray
+$hadSkipped = $false
+$hadFailed = $false
 
-    $argList = @(
-        'upgrade'
-        '--id', $id
-        '--accept-package-agreements'
-        '--accept-source-agreements'
-        '--silent'
-        '--disable-interactivity'
-    )
-
-    $proc = Start-Process -FilePath 'winget' -ArgumentList $argList -PassThru -WindowStyle Hidden
-    
-    # Sostituito con il nuovo countdown testuale infallibile
-    $completed = Wait-ProcessWithTextCountdown -Process $proc -TimeoutSeconds $TimeoutSeconds -PackageId $id
-
-    if (-not $completed -and -not $proc.HasExited) {
-        Write-Host ("ATTENZIONE: timeout su " + $id + ", aggiornamento saltato.") -ForegroundColor Yellow
-        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-        Add-Summary ("[SKIP-TIMEOUT] " + $id)
-        Add-Skipped ($id + " - timeout")
-        $skip++
+foreach ($pkg in $upgradeList) {
+    if ($ignoredIds -contains $pkg.Id) {
+        Write-Host (("Saltato da lista esclusioni: {0}" -f $pkg.Id)) -ForegroundColor Yellow
+        if ($SkippedPath) { Add-Content -Path $SkippedPath -Value (("IGNORED - {0} ({1})" -f $pkg.Name, $pkg.Id)) }
+        $hadSkipped = $true
         continue
     }
 
-    $exitCode = $proc.ExitCode
+    Write-Host (("Aggiorno: {0} ({1})" -f $pkg.Name, $pkg.Id)) -ForegroundColor Cyan
+    $p = Start-Process -FilePath 'winget' -ArgumentList @(
+        'upgrade', '--id', $pkg.Id,
+        '--accept-package-agreements',
+        '--accept-source-agreements',
+        '--silent',
+        '--disable-interactivity'
+    ) -PassThru -WindowStyle Hidden
 
-    if ($exitCode -eq 0) {
-        Write-Host ("OK: " + $id + " aggiornato.") -ForegroundColor Green
-        Add-Summary ("[OK] " + $id)
-        $ok++
+    if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $p.Kill() } catch {}
+        Write-Host (("Saltato per timeout: {0}" -f $pkg.Id)) -ForegroundColor Yellow
+        if ($SkippedPath) { Add-Content -Path $SkippedPath -Value (("TIMEOUT - {0} ({1})" -f $pkg.Name, $pkg.Id)) }
+        $hadSkipped = $true
+        continue
+    }
+
+    if ($p.ExitCode -eq 0) {
+        Write-Host (("OK: {0}" -f $pkg.Id)) -ForegroundColor Green
+        if ($SummaryPath) { Add-Content -Path $SummaryPath -Value (("OK - {0} ({1})" -f $pkg.Name, $pkg.Id)) }
     }
     else {
-        Write-Host ("ERRORE: " + $id + " non aggiornato. Codice " + $exitCode) -ForegroundColor Red
-        Add-Summary ("[ERR] " + $id + " - codice " + $exitCode)
-        $err++
+        Write-Host (("Fallito: {0} (codice {1})" -f $pkg.Id, $p.ExitCode)) -ForegroundColor Yellow
+        if ($SkippedPath) { Add-Content -Path $SkippedPath -Value (("FAILED({2}) - {0} ({1})" -f $pkg.Name, $pkg.Id, $p.ExitCode)) }
+        $hadFailed = $true
     }
 }
 
-Write-Host ("Risultato WinGet -> OK: " + $ok + " | Saltati: " + $skip + " | Errori: " + $err) -ForegroundColor Cyan
-Add-Summary ("Risultato WinGet -> OK: " + $ok + " | Saltati: " + $skip + " | Errori: " + $err)
-
-if ($err -gt 0) {
-    exit 51
-}
-elseif ($skip -gt 0) {
-    exit 50
-}
-else {
-    exit 0
-}
+if ($hadFailed) { exit 51 }
+if ($hadSkipped) { exit 50 }
+exit 0
